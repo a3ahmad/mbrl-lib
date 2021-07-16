@@ -223,7 +223,7 @@ def train_model_and_save_model_and_data(
     dataset_train, dataset_val = replay_buffer.get_iterators(
         cfg.model_batch_size,
         cfg.validation_ratio,
-        train_ensemble=len(model) is not None,
+        train_ensemble=len(model) > 1,
         ensemble_size=len(model),
         shuffle_each_epoch=True,
         bootstrap_permutes=cfg.get("bootstrap_permutes", False),
@@ -235,6 +235,7 @@ def train_model_and_save_model_and_data(
         dataset_val=dataset_val,
         num_epochs=cfg.get("num_epochs_train_model", None),
         patience=cfg.get("patience", 1),
+        improvement_threshold=cfg.get("improvement_threshold", 0.01),
         callback=callback,
     )
     if work_dir is not None:
