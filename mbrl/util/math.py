@@ -4,11 +4,14 @@
 # LICENSE file in the root directory of this source tree.
 import pathlib
 import pickle
-from typing import List, Optional, Tuple, Union
+from typing import Iterable, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
+import torch.distributions
+import torch.fft
 import torch.nn.functional as F
+from packaging import version
 
 import mbrl.types
 
@@ -63,7 +66,9 @@ def gaussian_nll(
 
 # inplace truncated normal function for pytorch.
 # credit to https://github.com/Xingyu-Lin/mbpo_pytorch/blob/main/model.py#L64
-def truncated_normal_(tensor: torch.Tensor, mean: float = 0, std: float = 1):
+def truncated_normal_(
+    tensor: torch.Tensor, mean: float = 0, std: float = 1
+) -> torch.Tensor:
     """Samples from a truncated normal distribution in-place.
 
     Args:
@@ -78,14 +83,11 @@ def truncated_normal_(tensor: torch.Tensor, mean: float = 0, std: float = 1):
     torch.nn.init.normal_(tensor, mean=mean, std=std)
     while True:
         cond = torch.logical_or(tensor < mean - 2 * std, tensor > mean + 2 * std)
-        if not torch.sum(cond):
+        bound_violations = torch.sum(cond).item()
+        if bound_violations == 0:
             break
-        tensor = torch.where(
-            cond,
-            torch.nn.init.normal_(
-                torch.ones(tensor.shape, device=tensor.device), mean=mean, std=std
-            ),
-            tensor,
+        tensor[cond] = torch.normal(
+            mean, std, size=(bound_violations,), device=tensor.device
         )
     return tensor
 
@@ -299,3 +301,126 @@ def propagate(
     if propagation_method == "expectation":
         return propagate_expectation(predictions)
     raise ValueError(f"Invalid propagation method {propagation_method}.")
+
+
+def rfftfreq(samples: int, device: torch.device) -> torch.Tensor:
+    if version.parse(torch.__version__) >= version.parse("1.8.0"):
+        return torch.fft.rfftfreq(samples, device=device)
+    freqs = np.fft.rfftfreq(samples)  # type: ignore
+    return torch.from_numpy(freqs).to(device)
+
+
+# ------------------------------------------------------------------------ #
+# Colored noise generator for iCEM
+# ------------------------------------------------------------------------ #
+# Generate colored noise (Gaussian distributed noise with a power law spectrum)
+# Adapted from colorednoise package, credit: https://github.com/felixpatzelt/colorednoise
+def powerlaw_psd_gaussian(
+    exponent: float,
+    size: Union[int, Iterable[int]],
+    device: torch.device,
+    fmin: float = 0,
+):
+    """Gaussian (1/f)**beta noise.
+
+    Based on the algorithm in: Timmer, J. and Koenig, M.:On generating power law noise.
+    Astron. Astrophys. 300, 707-710 (1995)
+
+    Normalised to unit variance
+
+    Args:
+        exponent (float): the power-spectrum of the generated noise is proportional to
+            S(f) = (1 / f)**exponent.
+        size (int or iterable): the output shape and the desired power spectrum is in the last
+            coordinate.
+        device (torch.device): device where computations will be performed.
+        fmin (float): low-frequency cutoff. Default: 0 corresponds to original paper.
+
+    Returns
+        (torch.Tensor): The samples.
+    """
+
+    # Make sure size is a list so we can iterate it and assign to it.
+    if isinstance(size, int):
+        size = [size]
+    else:
+        size = list(size)
+
+    # The number of samples in each time series
+    samples = size[-1]
+
+    # Calculate Frequencies (we assume a sample rate of one)
+    # Use fft functions for real output (-> hermitian spectrum)
+    f = rfftfreq(samples, device=device)
+
+    # Build scaling factors for all frequencies
+    s_scale = f
+    fmin = max(fmin, 1.0 / samples)  # Low frequency cutoff
+    ix = torch.sum(s_scale < fmin)  # Index of the cutoff
+    if ix and ix < len(s_scale):
+        s_scale[:ix] = s_scale[ix]
+    s_scale = s_scale ** (-exponent / 2.0)
+
+    # Calculate theoretical output standard deviation from scaling
+    w = s_scale[1:].detach().clone()
+    w[-1] *= (1 + (samples % 2)) / 2.0  # correct f = +-0.5
+    sigma = 2 * torch.sqrt(torch.sum(w**2)) / samples
+
+    # Adjust size to generate one Fourier component per frequency
+    size[-1] = len(f)
+
+    # Add empty dimension(s) to broadcast s_scale along last
+    # dimension of generated random power + phase (below)
+    dims_to_add = len(size) - 1
+    s_scale = s_scale[(None,) * dims_to_add + (Ellipsis,)]
+
+    # Generate scaled random power + phase
+    m = torch.distributions.Normal(loc=0.0, scale=s_scale.flatten())
+    sr = m.sample(tuple(size[:-1]))
+    si = m.sample(tuple(size[:-1]))
+
+    # If the signal length is even, frequencies +/- 0.5 are equal
+    # so the coefficient must be real.
+    if not (samples % 2):
+        si[..., -1] = 0
+
+    # Regardless of signal length, the DC component must be real
+    si[..., 0] = 0
+
+    # Combine power + corrected phase to Fourier components
+    s = sr + 1j * si
+
+    # Transform to real time series & scale to unit variance
+    y = torch.fft.irfft(s, n=samples, axis=-1) / sigma
+
+    return y
+
+
+# ------------------------------------------------------------------------ #
+# Pixel manipulation
+# ------------------------------------------------------------------------ #
+def quantize_obs(
+    obs: np.ndarray,
+    bit_depth: int,
+    original_bit_depth: int = 8,
+    add_noise: bool = False,
+):
+    """Quantizes an array of pixel observations to the desired bit depth.
+
+    Args:
+        obs (np.ndarray): the array to quantize.
+        bit_depth (int): the desired bit depth.
+        original_bit_depth (int, optional): the original bit depth, defaults to 8.
+        add_noise (bool, optional): if ``True``, uniform noise in the range
+            (0, 2 ** (8 - bit_depth)) will be added. Defaults to ``False``.`
+
+    Returns:
+        (np.ndarray): the quantized version of the array.
+    """
+    ratio = 2 ** (original_bit_depth - bit_depth)
+    quantized_obs = (obs // ratio) * ratio
+    if add_noise:
+        quantized_obs = quantized_obs.astype(np.double) + ratio * np.random.rand(
+            *obs.shape
+        )
+    return quantized_obs

@@ -22,10 +22,11 @@ SAC_TRAIN_LOG_FORMAT = [
     ("step", "S", "int"),
     ("batch_reward", "BR", "float"),
     ("actor_loss", "ALOSS", "float"),
+    ("actor_target_entropy", "TENTR", "float"),
     ("critic_loss", "CLOSS", "float"),
     ("alpha_loss", "TLOSS", "float"),
-    ("alpha_value", "TVAL", "float"),
-    ("actor_entropy", "AENT", "float"),
+    ("alpha_value", "ALPHA", "float"),
+    ("actor_entropy", "AENTR", "float"),
 ]
 
 
@@ -93,7 +94,7 @@ class MetersGroup(object):
         if len(self._meters) == 0:
             return
         if save:
-            data = dict([(key, meter.value()) for key, meter in self._meters.items()])
+            data = {key: meter.value() for key, meter in self._meters.items()}
             data["step"] = step
             self._dump_to_csv(data)
             self._dump_to_console(data, prefix, color)

@@ -2,6 +2,8 @@
 #
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
+from typing import Optional
+
 import numpy as np
 import omegaconf
 import pytest
@@ -14,7 +16,7 @@ import mbrl.util.common as utils
 
 class MockModel(models.Model):
     def __init__(self, x, y, in_size, out_size):
-        super().__init__()
+        super().__init__(None)
         self.in_size = in_size
         self.out_size = out_size
         self.x = x
@@ -36,11 +38,9 @@ def mock_obs_func():
 def test_create_one_dim_tr_model():
     cfg_dict = {
         "dynamics_model": {
-            "model": {
-                "_target_": "tests.core.test_common_utils.MockModel",
-                "x": 1,
-                "y": 2,
-            }
+            "_target_": "tests.core.test_common_utils.MockModel",
+            "x": 1,
+            "y": 2,
         },
         "algorithm": {
             "learned_rewards": True,
@@ -65,8 +65,8 @@ def test_create_one_dim_tr_model():
     assert dynamics_model.input_normalizer.mean.dtype == torch.float32
 
     # Check given input/output sizes, overrides active, and no learned rewards option
-    cfg.dynamics_model.model.in_size = 11
-    cfg.dynamics_model.model.out_size = 7
+    cfg.dynamics_model.in_size = 11
+    cfg.dynamics_model.out_size = 7
     cfg.algorithm.learned_rewards = False
     cfg.overrides.no_delta_list = [0]
     cfg.overrides.num_elites = 8
@@ -92,7 +92,7 @@ def test_create_replay_buffer():
     trial_length = 20
     num_trials = 10
     cfg_dict = {
-        "dynamics_model": {"model": {"ensemble_size": 1}},
+        "dynamics_model": {"ensemble_size": 1},
         "algorithm": {},
         "overrides": {
             "num_steps": num_trials * trial_length,
@@ -107,7 +107,8 @@ def test_create_replay_buffer():
         assert buffer.next_obs.shape == (how_many, obs_shape[0])
         assert buffer.action.shape == (how_many, act_shape[0])
         assert buffer.reward.shape == (how_many,)
-        assert buffer.done.shape == (how_many,)
+        assert buffer.terminated.shape == (how_many,)
+        assert buffer.truncated.shape == (how_many,)
 
     # Test reading from the above configuration and no bootstrap replay buffer
     buffer = utils.create_replay_buffer(cfg, obs_shape, act_shape)
@@ -136,9 +137,9 @@ class MockModelEnv:
 
     def reset(self, obs0, return_as_np=None):
         self.obs = obs0
-        return obs0
+        return {}
 
-    def step(self, action, sample=None):
+    def step(self, action, model_state, sample=None):
         next_obs = self.obs + action[:, :1]
         reward = np.ones(next_obs.shape[0])
         done = np.zeros(next_obs.shape[0])
@@ -197,17 +198,18 @@ class MockEnv:
         self.traj = 0
         self.val = 0
 
-    def reset(self, from_zero=False):
+    def reset(self, from_zero=False, seed: Optional[int]=None):
         if from_zero:
             self.traj = 0
         self.val = 100 * self.traj
         self.traj += 1
-        return self.val
+        return self.val, {}
 
     def step(self, _):
         self.val += 1
-        done = self.val % _MOCK_TRAJ_LEN == 0
-        return self.val, 0, done, None
+        terminated = self.val % _MOCK_TRAJ_LEN == 0
+        truncated = False
+        return self.val, 0, terminated, truncated, {}
 
 
 class MockZeroAgent:
@@ -236,13 +238,14 @@ def test_populate_replay_buffer_no_trajectories():
     assert buffer.num_stored == num_steps
 
     # Check the order in which things were inserted
-    obs = env.reset(from_zero=True)
-    done = False
+    obs, _ = env.reset(from_zero=True)
+    terminated = False
+    truncated = False
     for i in range(num_steps):
-        if done:
-            obs = env.reset()
+        if terminated or truncated:
+            obs, _ = env.reset()
         assert buffer.obs[i] == obs
-        obs, _, done, _ = env.step(None)
+        obs, _, terminated, truncated, _ = env.step(None)
 
 
 def test_populate_replay_buffer_collect_trajectories():
@@ -268,14 +271,14 @@ def test_get_basic_buffer_iterators():
     buffer = mbrl.util.replay_buffer.ReplayBuffer(1000, (1,), (1,))
     dummy = np.ones(1)
     for i in range(900):
-        buffer.add(dummy, dummy, dummy, i, False)
+        buffer.add(dummy, dummy, dummy, i, False, False)
 
     train_iter, val_iter = mbrl.util.common.get_basic_buffer_iterators(buffer, 32, 0.1)
     assert train_iter.num_stored == 810 and val_iter.num_stored == 90
     all_rewards = []
     for it in [train_iter, val_iter]:
         for batch in it:
-            _, _, _, reward, _ = batch.astuple()
+            _, _, _, reward, _, _ = batch.astuple()
             all_rewards.extend(reward)
     assert sorted(all_rewards) == list(range(900))
 
@@ -290,12 +293,12 @@ def test_get_sequence_buffer_iterators():
     k = 0
     for i in range(num_trajectories_train):
         for j in range(20):
-            buffer.add(dummy, dummy, dummy, k, False)
+            buffer.add(dummy, dummy, dummy, k, False, False)
             k += 1
         buffer.close_trajectory()
     for i in range(num_trajectories_val):
         for j in range(20):
-            buffer.add(dummy, dummy, dummy, k, False)
+            buffer.add(dummy, dummy, dummy, k, False, False)
             k += 1
         buffer.close_trajectory()
 
@@ -315,13 +318,13 @@ def test_get_sequence_buffer_iterators():
         train_rewards = []
         for batch in train_iter:
             assert batch.rewards.ndim == 3  # (ensemble, batch_size, sequence)
-            _, _, _, reward, _ = batch.astuple()
+            _, _, _, reward, _, _ = batch.astuple()
             train_rewards.append(reward)  # only need start of sequence
         train_rewards = np.unique(np.concatenate(train_rewards, axis=1))
         val_rewards = []
         for batch in val_iter:
             assert batch.rewards.ndim == 2  # (batch_size, sequence) since non-bootstrap
-            _, _, _, reward, _ = batch.astuple()
+            _, _, _, reward, _, _ = batch.astuple()
             val_rewards.append(reward)  # only need start of sequence
         val_rewards = np.unique(np.concatenate(val_rewards, axis=0))
         # Check that validation and training were separate splits
@@ -342,3 +345,42 @@ def test_model_trainer_maybe_get_best_weights_negative_score():
         model_trainer.maybe_get_best_weights(previous_eval_value, eval_value_smaller)
         is not None
     )
+
+
+def test_bootstrap_rb_sample_obs3d():
+    capacity = 1000
+    ensemble_size = 2
+    batch_size = 16
+    obs_shape = (40, 40, 3)
+    act_shape = (1,)
+    buffer = mbrl.util.ReplayBuffer(capacity, obs_shape, act_shape, obs_type=np.int8)
+    obs = np.ones(obs_shape)
+    for i in range(20 * batch_size):
+        buffer.add(obs, np.zeros(act_shape), obs + 1, 0, False, False)
+        obs += 1
+
+    assert buffer.obs.shape == (capacity,) + obs_shape
+    assert buffer.next_obs.shape == (capacity,) + obs_shape
+
+    it, _ = mbrl.util.common.get_basic_buffer_iterators(
+        buffer, batch_size, 0.0, ensemble_size=ensemble_size
+    )
+
+    for batch in it:
+        assert batch.obs.shape == (ensemble_size, batch_size) + obs_shape
+        assert batch.obs.shape == batch.next_obs.shape
+        diff = batch.next_obs - batch.obs
+        assert diff.min() == 1 and diff.max() == 1
+        # Each member should have a different batch
+        # yes, this is random, but the odds of a collision are
+        # C(500, 16) ~ 5e-29, so I think it's (probably) fine
+        for i in range(ensemble_size):
+            for j in range(i + 1, ensemble_size):
+                assert not np.array_equal(batch.obs[i], batch.obs[j])
+
+
+def test_truncated_normal():
+    t_original = torch.empty((100, 2))
+    t_new = mbrl.util.math.truncated_normal_(t_original)
+    assert t_original is t_new
+    assert (t_original > -2).all().item() and (t_original < 2).all().item()

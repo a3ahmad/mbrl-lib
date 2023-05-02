@@ -6,7 +6,7 @@ import argparse
 import pathlib
 from typing import Generator, List, Optional, Tuple, cast
 
-import gym.wrappers
+import gymnasium as gym
 import matplotlib.animation as animation
 import matplotlib.pyplot as plt
 import numpy as np
@@ -16,7 +16,6 @@ import mbrl
 import mbrl.models
 import mbrl.planning
 import mbrl.util.common
-import mbrl.util.mujoco
 
 VisData = Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]
 
@@ -49,8 +48,9 @@ class Visualizer:
         self.num_steps = num_steps
 
         self.cfg = mbrl.util.common.load_hydra_cfg(self.results_path)
+        self.handler = mbrl.util.create_handler(self.cfg)
 
-        self.env, term_fn, reward_fn = mbrl.util.mujoco.make_env(self.cfg)
+        self.env, term_fn, reward_fn = self.handler.make_env(self.cfg)
 
         self.reward_fn = reward_fn
 
@@ -109,7 +109,7 @@ class Visualizer:
                 num_samples=self.num_model_samples,
             )
             # Then evaluate in the environment
-            real_obses, real_rewards, _ = mbrl.util.mujoco.rollout_mujoco_env(
+            real_obses, real_rewards, _ = self.handler.rollout_env(
                 cast(gym.wrappers.TimeLimit, self.env),
                 obs,
                 self.lookahead,
@@ -118,7 +118,7 @@ class Visualizer:
             )
         else:
             # When not using MPC, rollout the agent on the environment and get its actions
-            real_obses, real_rewards, actions = mbrl.util.mujoco.rollout_mujoco_env(
+            real_obses, real_rewards, actions = self.handler.rollout_env(
                 cast(gym.wrappers.TimeLimit, self.env),
                 obs,
                 self.lookahead,
@@ -135,13 +135,14 @@ class Visualizer:
         return real_obses, real_rewards, model_obses, model_rewards, actions
 
     def vis_rollout(self, use_mpc: bool = False) -> Generator:
-        obs = self.env.reset()
-        done = False
+        obs, _ = self.env.reset()
+        terminated = False
+        truncated = False
         i = 0
-        while not done:
+        while not terminated and not truncated:
             vis_data = self.get_obs_rewards_and_actions(obs, use_mpc=use_mpc)
             action = self.agent.act(obs)
-            next_obs, reward, done, _ = self.env.step(action)
+            next_obs, reward, terminated, truncated, _ = self.env.step(action)
             self.total_reward += reward
             obs = next_obs
             i += 1

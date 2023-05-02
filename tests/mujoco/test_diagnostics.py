@@ -6,7 +6,7 @@ import os
 import pathlib
 import tempfile
 
-import gym
+import gymnasium as gym
 import hydra
 import numpy as np
 import torch
@@ -23,7 +23,7 @@ _HYDRA_DIR = pathlib.Path(_DIR.name) / ".hydra"
 pathlib.Path.mkdir(_HYDRA_DIR)
 
 # Environment information
-_ENV_NAME = "HalfCheetah-v2"
+_ENV_NAME = "HalfCheetah-v4"
 _ENV = gym.make(_ENV_NAME)
 _OBS_SHAPE = _ENV.observation_space.shape
 _ACT_SHAPE = _ENV.action_space.shape
@@ -61,11 +61,15 @@ _MBPO_CFG_DICT = _CFG_DICT.copy()
 _MBPO_CFG_DICT["algorithm"] = _MBPO__ALGO_CFG
 _MBPO_CFG_DICT["overrides"].update(
     {
-        "sac_alpha_lr": 3e-4,
-        "sac_actor_lr": 3e-4,
-        "sac_actor_update_frequency": 4,
-        "sac_critic_lr": 3.7e-5,
-        "sac_critic_target_update_frequency": 16,
+        "sac_gamma": 0.99,
+        "sac_tau": 0.005,
+        "sac_alpha": 0.2,
+        "sac_policy": "Gaussian",
+        "sac_target_update_interval": 16,
+        "sac_automatic_entropy_tuning": True,
+        "sac_hidden_size": 200,
+        "sac_lr": 0.0003,
+        "sac_batch_size": 256,
         "sac_target_entropy": -3,
         "sac_hidden_depth": 2,
         "num_steps": 2000,
@@ -73,15 +77,21 @@ _MBPO_CFG_DICT["overrides"].update(
         "cem_population_size": 500,
         "cem_num_iters": 5,
         "cem_alpha": 0.1,
+        "cem_clipped_normal": False,
     }
 )
 
 # Extend default config file with information for a trajectory optimizer agent
 with open(_REPO_DIR / _CONF_DIR / "algorithm" / "pets.yaml", "r") as f:
     _PETS_ALGO_CFG = yaml.safe_load(f)
+with open(_REPO_DIR / _CONF_DIR / "action_optimizer" / "cem.yaml", "r") as f:
+    _CEM_CFG = yaml.safe_load(f)
 _CFG_DICT["algorithm"].update(_PETS_ALGO_CFG)
 _CFG_DICT["algorithm"]["learned_rewards"] = True
 _CFG_DICT["algorithm"]["agent"]["verbose"] = False
+_CFG_DICT["action_optimizer"] = _CEM_CFG
+_CFG_DICT["seed"] = 0
+_MBPO_CFG_DICT["seed"] = 0
 _CFG = OmegaConf.create(_CFG_DICT)
 _MBPO_CFG = OmegaConf.create(_MBPO_CFG_DICT)
 
@@ -91,8 +101,8 @@ one_dim_model.set_elite(range(_CFG["overrides"]["num_elites"]))
 one_dim_model.save(_DIR.name)
 
 # Create replay buffers and save to directory with some data
-_CFG.dynamics_model.model.in_size = "???"
-_CFG.dynamics_model.model.out_size = "???"
+_CFG.dynamics_model.in_size = "???"
+_CFG.dynamics_model.out_size = "???"
 replay_buffer = mbrl.util.common.create_replay_buffer(_CFG, _OBS_SHAPE, _ACT_SHAPE)
 mbrl.util.common.rollout_agent_trajectories(
     _ENV, 128, planning.RandomAgent(_ENV), {}, replay_buffer=replay_buffer
@@ -117,8 +127,7 @@ def test_eval_on_dataset():
 def test_finetuner():
     planning.complete_agent_cfg(_ENV, _MBPO_CFG.algorithm.agent)
     agent = hydra.utils.instantiate(_MBPO_CFG.algorithm.agent)
-    torch.save(agent.critic.state_dict(), os.path.join(_DIR.name, "critic.pth"))
-    torch.save(agent.actor.state_dict(), os.path.join(_DIR.name, "actor.pth"))
+    agent.save_checkpoint(ckpt_path=os.path.join(_DIR.name, "sac.pth"))
 
     with open(_HYDRA_DIR / "config.yaml", "w") as f:
         OmegaConf.save(_MBPO_CFG, f)
